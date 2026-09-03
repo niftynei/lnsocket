@@ -78,14 +78,27 @@ See [examples/node.js](examples/node.js)
 
 ### Go
 
-There is a Go version of lnsocket written using lnd's brontide[^3].
+The Go package implements BOLT 8 and Commando directly. It supports multiple
+in-flight RPCs on one connection, correlates chunked responses by their wire
+request ID, responds to peer pings, rotates transport keys, and provides
+context-aware connection and RPC methods. It does not depend on `lnd`.
 
 You can import it via:
 
-    import "github.com/jb55/lnsocket/go"
+    import "github.com/niftynei/lnsocket/go"
 
-It is currently used in fiatjaf's makeinvoice go library[^4] if you want an
-example of its usage.
+```go
+ln := &lnsocket.LNSocket{}
+if err := ln.ConnectAndInit(host, nodeID); err != nil {
+    return err
+}
+defer ln.Disconnect()
+
+response, err := ln.RpcContext(ctx, rune, "getinfo", "{}")
+```
+
+`Connect`, `Rpc`, `GenKey`, and `Disconnect` remain available for compatibility.
+New callers should prefer `ConnectContext`, `RpcContext`, and `Close`.
 
 ### Rust
 
@@ -111,5 +124,3 @@ You can open a PR on github[^2] as well
 
 [^1]: https://git-send-email.io/
 [^2]: https://github.com/jb55/lnsocket
-[^3]: https://github.com/lightningnetwork/lnd/tree/master/brontide
-[^4]: https://github.com/fiatjaf/makeinvoice/blob/d523b35084af04883f94323dc11a50c2a99d253d/makeinvoice.go#L366

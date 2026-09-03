@@ -1,18 +1,19 @@
 package lnsocket
 
 import (
-	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/lightningnetwork/lnd/brontide"
-	"github.com/lightningnetwork/lnd/keychain"
-	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/tor"
 )
 
 const (
@@ -21,217 +22,334 @@ const (
 	COMMANDO_REPLY_TERM      = 0x594d
 )
 
-type CommandoMsg struct {
-	Rune      string
-	Method    string
-	Params    string
-	RequestId string
-	ReturnQ   chan *CommandoResult
+var ErrNotConnected = errors.New("lnsocket is not connected and initialized")
+
+type rpcResult struct {
+	value string
+	err   error
 }
 
-type CommandoResult struct {
-	Result    string
-	Err       error
-}
-
-func NewCommandoMsg(token string, method string, params string) CommandoMsg {
-	return CommandoMsg{
-		Rune:   token,
-		Method: method,
-		Params: params,
-		RequestId: fmt.Sprintf("lnsocket:%d", rand.Uint64()),
-	}
-}
-
-// A compile time check to ensure Init implements the lnwire.Message
-// interface.
-
-func (msg *CommandoMsg) MsgType() lnwire.MessageType {
-	return COMMANDO_CMD
-}
-
-func (msg *CommandoMsg) Decode(reader io.Reader, size uint32) error {
-	return fmt.Errorf("implememt commando decode?")
-}
-
-func (msg *CommandoMsg) Encode(buf *bytes.Buffer, pver uint32) error {
-	if err := lnwire.WriteUint64(buf, 0); err != nil {
-		return err
-	}
-
-	buf.WriteString("{\"method\": \"")
-	buf.WriteString(msg.Method)
-	buf.WriteString("\",\"params\":")
-	buf.WriteString(msg.Params)
-	buf.WriteString(",\"rune\":\"")
-	buf.WriteString(msg.Rune)
-	buf.WriteString("\",\"id\":\"")
-	buf.WriteString(msg.RequestId)
-	buf.WriteString("\",\"jsonrpc\":\"2.0\"}")
-
-	return nil
-}
-
+// LNSocket is a concurrent Commando client over Lightning's native BOLT 8 transport.
 type LNSocket struct {
-	Conn        net.Conn
-	PrivKeyECDH *keychain.PrivKeyECDH
-	Queue        chan *CommandoMsg
+	Conn      net.Conn
+	mu        sync.Mutex
+	private   *btcec.PrivateKey
+	transport *transport
+	pending   map[uint64]chan rpcResult
+	done      chan struct{}
+	closeOnce sync.Once
+	readErr   error
 }
 
 func (ln *LNSocket) GenKey() {
-	remotePriv, _ := btcec.NewPrivateKey()
-	ln.PrivKeyECDH = &keychain.PrivKeyECDH{PrivKey: remotePriv}
+	key, err := btcec.NewPrivateKey()
+	if err != nil {
+		panic(fmt.Sprintf("generate secp256k1 key: %v", err))
+	}
+	ln.mu.Lock()
+	ln.private = key
+	ln.mu.Unlock()
+}
+func (ln *LNSocket) Connect(hostname, pubkey string) error {
+	return ln.ConnectContext(context.Background(), hostname, pubkey)
 }
 
-func (ln *LNSocket) ConnectWith(netAddr *lnwire.NetAddress) error {
-	conn, err := brontide.Dial(ln.PrivKeyECDH, netAddr, tor.DefaultConnTimeout, net.DialTimeout)
-	ln.Conn = conn
-	return err
-}
-
-func (ln *LNSocket) Connect(hostname string, pubkey string) error {
-	addr, err := net.ResolveTCPAddr("tcp", hostname)
+func (ln *LNSocket) ConnectContext(ctx context.Context, hostname, pubkey string) error {
+	remoteBytes, err := hex.DecodeString(pubkey)
+	if err != nil {
+		return fmt.Errorf("decode node public key: %w", err)
+	}
+	remote, err := btcec.ParsePubKey(remoteBytes)
+	if err != nil {
+		return fmt.Errorf("parse node public key: %w", err)
+	}
+	ln.mu.Lock()
+	local := ln.private
+	ln.mu.Unlock()
+	if local == nil {
+		local, err = btcec.NewPrivateKey()
+		if err != nil {
+			return fmt.Errorf("generate local key: %w", err)
+		}
+		ln.mu.Lock()
+		ln.private = local
+		ln.mu.Unlock()
+	}
+	conn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", hostname)
 	if err != nil {
 		return err
 	}
-	bytes, err := hex.DecodeString(pubkey)
-	if err != nil {
+	handshakeDeadline := time.Now().Add(10 * time.Second)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(handshakeDeadline) {
+		handshakeDeadline = deadline
+	}
+	if err := conn.SetDeadline(handshakeDeadline); err != nil {
+		_ = conn.Close()
 		return err
 	}
-	key, err := btcec.ParsePubKey(bytes)
+	ephemeral, err := btcec.NewPrivateKey()
 	if err != nil {
+		_ = conn.Close()
 		return err
 	}
-
-	netAddr := &lnwire.NetAddress{
-		IdentityKey: key,
-		Address:     addr,
-	}
-
-	return ln.ConnectWith(netAddr)
-}
-
-func (ln *LNSocket) PerformInit() error {
-	no_features := lnwire.NewRawFeatureVector()
-	init_reply_msg := lnwire.NewInitMessage(no_features, no_features)
-
-	var b bytes.Buffer
-	_, err := lnwire.WriteMessage(&b, init_reply_msg, 0)
-	if err != nil {
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
 		return err
 	}
-	_, err = ln.Conn.Write(b.Bytes())
-
-	// receive the first init msg
-	_, _, err = ln.Recv()
+	t, err := initiatorHandshake(conn, local, remote, ephemeral)
 	if err != nil {
+		_ = conn.Close()
 		return err
 	}
-
-	ln.Queue = make(chan *CommandoMsg, 50)
-	go processQueue(ln)
-
+	ln.mu.Lock()
+	ln.Conn, ln.transport, ln.pending, ln.done, ln.readErr = conn, t, make(map[uint64]chan rpcResult), make(chan struct{}), nil
+	ln.closeOnce = sync.Once{}
+	ln.mu.Unlock()
 	return nil
 }
 
-func (ln *LNSocket) Rpc(token string, method string, params string) (string, error) {
-
-	if ln.Queue == nil {
-		return "", fmt.Errorf("Queue is shutdown, are you connected?")
+func (ln *LNSocket) PerformInit() error {
+	ln.mu.Lock()
+	t := ln.transport
+	ln.mu.Unlock()
+	if t == nil {
+		return ErrNotConnected
 	}
-
-	commando_msg := NewCommandoMsg(token, method, params)
-
-	commando_msg.ReturnQ = make(chan *CommandoResult)
-
-	ln.Queue <- &commando_msg
-	result := <- commando_msg.ReturnQ
-
-	return result.Result, result.Err
+	if err := t.writeMessage([]byte{0, 16, 0, 0}); err != nil {
+		return err
+	}
+	for {
+		message, err := t.readMessage()
+		if err != nil {
+			return fmt.Errorf("read peer init: %w", err)
+		}
+		if len(message) < 2 {
+			return errors.New("peer sent a truncated Lightning message")
+		}
+		switch binary.BigEndian.Uint16(message[:2]) {
+		case 16:
+			go ln.readLoop()
+			return nil
+		case 18:
+			if err := ln.replyPong(message[2:]); err != nil {
+				return err
+			}
+		}
+	}
 }
 
-func ParseMsgType(bytes []byte) uint16 {
-	return uint16(bytes[0])<<8 | uint16(bytes[1])
+func (ln *LNSocket) ConnectAndInit(hostname, pubkey string) error {
+	if err := ln.Connect(hostname, pubkey); err != nil {
+		return err
+	}
+	return ln.PerformInit()
+}
+func (ln *LNSocket) Rpc(token, method, params string) (string, error) {
+	return ln.RpcContext(context.Background(), token, method, params)
 }
 
+func (ln *LNSocket) RpcContext(ctx context.Context, token, method, params string) (string, error) {
+	rawParams := json.RawMessage(params)
+	if !json.Valid(rawParams) {
+		return "", errors.New("Commando params must be valid JSON")
+	}
+	id, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(struct {
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params"`
+		Rune    string          `json:"rune"`
+		ID      string          `json:"id"`
+		JSONRPC string          `json:"jsonrpc"`
+	}{method, rawParams, token, fmt.Sprintf("lnsocket:%016x", id), "2.0"})
+	if err != nil {
+		return "", err
+	}
+	result := make(chan rpcResult, 1)
+	ln.mu.Lock()
+	if ln.transport == nil || ln.done == nil {
+		ln.mu.Unlock()
+		return "", ErrNotConnected
+	}
+	if _, exists := ln.pending[id]; exists {
+		ln.mu.Unlock()
+		return "", errors.New("random Commando request ID collision")
+	}
+	ln.pending[id] = result
+	t, done := ln.transport, ln.done
+	ln.mu.Unlock()
+	message := make([]byte, 10+len(payload))
+	binary.BigEndian.PutUint16(message[:2], COMMANDO_CMD)
+	binary.BigEndian.PutUint64(message[2:10], id)
+	copy(message[10:], payload)
+	if err := t.writeMessage(message); err != nil {
+		ln.removePending(id)
+		return "", err
+	}
+	select {
+	case response := <-result:
+		return response.value, response.err
+	case <-ctx.Done():
+		ln.removePending(id)
+		return "", ctx.Err()
+	case <-done:
+		ln.mu.Lock()
+		err := ln.readErr
+		ln.mu.Unlock()
+		if err == nil {
+			err = net.ErrClosed
+		}
+		return "", err
+	}
+}
+
+func (ln *LNSocket) readLoop() {
+	chunks := make(map[uint64][]byte)
+	for {
+		ln.mu.Lock()
+		t := ln.transport
+		ln.mu.Unlock()
+		message, err := t.readMessage()
+		if err != nil {
+			ln.fail(err)
+			return
+		}
+		if len(message) < 2 {
+			ln.fail(errors.New("peer sent a truncated Lightning message"))
+			return
+		}
+		typ := binary.BigEndian.Uint16(message[:2])
+		switch typ {
+		case COMMANDO_REPLY_CONTINUES, COMMANDO_REPLY_TERM:
+			if len(message) < 10 {
+				ln.fail(errors.New("peer sent a truncated Commando response"))
+				return
+			}
+			id := binary.BigEndian.Uint64(message[2:10])
+			if !ln.isPending(id) {
+				delete(chunks, id)
+				continue
+			}
+			chunks[id] = append(chunks[id], message[10:]...)
+			if len(chunks[id]) > 16<<20 {
+				ln.completeError(id, errors.New("Commando response exceeds 16 MiB"))
+				delete(chunks, id)
+				continue
+			}
+			if typ == COMMANDO_REPLY_TERM {
+				ln.complete(id, string(chunks[id]))
+				delete(chunks, id)
+			}
+		case 18:
+			if err := ln.replyPong(message[2:]); err != nil {
+				ln.fail(err)
+				return
+			}
+		}
+	}
+}
+
+func (ln *LNSocket) isPending(id uint64) bool {
+	ln.mu.Lock()
+	defer ln.mu.Unlock()
+	_, ok := ln.pending[id]
+	return ok
+}
+
+func (ln *LNSocket) replyPong(payload []byte) error {
+	if len(payload) < 4 {
+		return errors.New("peer sent a truncated ping")
+	}
+	size := int(binary.BigEndian.Uint16(payload[:2]))
+	message := make([]byte, 4+size)
+	binary.BigEndian.PutUint16(message[:2], 19)
+	binary.BigEndian.PutUint16(message[2:4], uint16(size))
+	ln.mu.Lock()
+	t := ln.transport
+	ln.mu.Unlock()
+	return t.writeMessage(message)
+}
+func (ln *LNSocket) complete(id uint64, value string) {
+	ln.mu.Lock()
+	result := ln.pending[id]
+	delete(ln.pending, id)
+	ln.mu.Unlock()
+	if result != nil {
+		result <- rpcResult{value: value}
+	}
+}
+
+func (ln *LNSocket) completeError(id uint64, err error) {
+	ln.mu.Lock()
+	result := ln.pending[id]
+	delete(ln.pending, id)
+	ln.mu.Unlock()
+	if result != nil {
+		result <- rpcResult{err: err}
+	}
+}
+func (ln *LNSocket) removePending(id uint64) { ln.mu.Lock(); delete(ln.pending, id); ln.mu.Unlock() }
+func (ln *LNSocket) fail(err error) {
+	ln.mu.Lock()
+	if ln.readErr == nil {
+		ln.readErr = err
+	}
+	pending := ln.pending
+	ln.pending = make(map[uint64]chan rpcResult)
+	done := ln.done
+	ln.mu.Unlock()
+	for _, result := range pending {
+		result <- rpcResult{err: err}
+	}
+	ln.closeOnce.Do(func() {
+		if done != nil {
+			close(done)
+		}
+	})
+}
+func (ln *LNSocket) Close() error {
+	ln.mu.Lock()
+	conn := ln.Conn
+	ln.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	err := conn.Close()
+	ln.fail(net.ErrClosed)
+	ln.mu.Lock()
+	ln.Conn, ln.transport = nil, nil
+	ln.mu.Unlock()
+	return err
+}
+func (ln *LNSocket) Disconnect() { _ = ln.Close() }
 func (ln *LNSocket) Recv() (uint16, []byte, error) {
-	res := make([]byte, 65535)
-	n, err := ln.Conn.Read(res)
+	ln.mu.Lock()
+	t := ln.transport
+	ln.mu.Unlock()
+	if t == nil {
+		return 0, nil, ErrNotConnected
+	}
+	message, err := t.readMessage()
 	if err != nil {
 		return 0, nil, err
 	}
-	if n < 2 {
-		return 0, nil, fmt.Errorf("read too small")
+	if len(message) < 2 {
+		return 0, nil, io.ErrUnexpectedEOF
 	}
-	res = res[:n]
-	msgtype := ParseMsgType(res)
-	return msgtype, res[2:], nil
+	return binary.BigEndian.Uint16(message[:2]), message[2:], nil
 }
-
-func (ln *LNSocket) rpcReadAll() (string, error) {
-	all := []byte{}
-	for {
-		msgtype, res, err := ln.Recv()
-		if err != nil {
-			return "", err
-		}
-		switch msgtype {
-		case COMMANDO_REPLY_CONTINUES:
-			all = append(all, res[8:]...)
-			continue
-		case COMMANDO_REPLY_TERM:
-			all = append(all, res[8:]...)
-			return string(all), nil
-		default:
-			continue
-		}
+func ParseMsgType(message []byte) uint16 {
+	if len(message) < 2 {
+		return 0
 	}
+	return binary.BigEndian.Uint16(message[:2])
 }
-
-func (ln *LNSocket) Disconnect() {
-	ln.Conn.Close()
-	close(ln.Queue)
-	ln.Queue = nil
-}
-
-func processQueue(ln *LNSocket) {
-	for {
-		commando_msg, more := <- ln.Queue
-
-		if !more {
-			return
-		}
-		var b bytes.Buffer
-		_, err := lnwire.WriteMessage(&b, commando_msg, 0)
-		if err != nil {
-			commando_msg.ReturnQ <- &CommandoResult{
-				Err: err,
-			}
-			continue
-		}
-
-		bs := b.Bytes()
-		_, err = ln.Conn.Write(bs)
-		if err != nil {
-			commando_msg.ReturnQ <- &CommandoResult{
-				Err: err,
-			}
-			continue
-		}
-
-		result, err := ln.rpcReadAll()
-		commando_msg.ReturnQ <- &CommandoResult{
-			Result: result,
-			Err: err,
-		}
+func randomID() (uint64, error) {
+	var value [8]byte
+	if _, err := io.ReadFull(rand.Reader, value[:]); err != nil {
+		return 0, err
 	}
-}
-
-func (ln *LNSocket) ConnectAndInit(hostname string, pubkey string) error {
-	err := ln.Connect(hostname, pubkey)
-	if err != nil {
-		return err
-	}
-
-	return ln.PerformInit()
+	return binary.BigEndian.Uint64(value[:]), nil
 }
