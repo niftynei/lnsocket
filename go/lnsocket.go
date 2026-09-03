@@ -109,12 +109,25 @@ func (ln *LNSocket) ConnectContext(ctx context.Context, hostname, pubkey string)
 }
 
 func (ln *LNSocket) PerformInit() error {
+	return ln.PerformInitContext(context.Background())
+}
+
+func (ln *LNSocket) PerformInitContext(ctx context.Context) error {
 	ln.mu.Lock()
 	t := ln.transport
+	conn := ln.Conn
 	ln.mu.Unlock()
 	if t == nil {
 		return ErrNotConnected
 	}
+	deadline := time.Now().Add(10 * time.Second)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	if err := t.writeMessage([]byte{0, 16, 0, 0}); err != nil {
 		return err
 	}
@@ -139,10 +152,18 @@ func (ln *LNSocket) PerformInit() error {
 }
 
 func (ln *LNSocket) ConnectAndInit(hostname, pubkey string) error {
-	if err := ln.Connect(hostname, pubkey); err != nil {
+	return ln.ConnectAndInitContext(context.Background(), hostname, pubkey)
+}
+
+func (ln *LNSocket) ConnectAndInitContext(ctx context.Context, hostname, pubkey string) error {
+	if err := ln.ConnectContext(ctx, hostname, pubkey); err != nil {
 		return err
 	}
-	return ln.PerformInit()
+	if err := ln.PerformInitContext(ctx); err != nil {
+		_ = ln.Close()
+		return err
+	}
+	return nil
 }
 func (ln *LNSocket) Rpc(token, method, params string) (string, error) {
 	return ln.RpcContext(context.Background(), token, method, params)

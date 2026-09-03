@@ -89,7 +89,7 @@ You can import it via:
 
 ```go
 ln := &lnsocket.LNSocket{}
-if err := ln.ConnectAndInit(host, nodeID); err != nil {
+if err := ln.ConnectAndInitContext(ctx, host, nodeID); err != nil {
     return err
 }
 defer ln.Disconnect()
@@ -97,8 +97,9 @@ defer ln.Disconnect()
 response, err := ln.RpcContext(ctx, rune, "getinfo", "{}")
 ```
 
-`Connect`, `Rpc`, `GenKey`, and `Disconnect` remain available for compatibility.
-New callers should prefer `ConnectContext`, `RpcContext`, and `Close`.
+`Connect`, `ConnectAndInit`, `Rpc`, `GenKey`, and `Disconnect` remain available
+for compatibility. New callers should prefer their context-aware counterparts
+and `Close`.
 
 ### Rust
 
