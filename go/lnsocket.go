@@ -128,7 +128,9 @@ func (ln *LNSocket) PerformInitContext(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
-	if err := t.writeMessage([]byte{0, 16, 0, 0}); err != nil {
+	// A minimal BOLT #1 init contains two empty feature vectors: the legacy
+	// globalfeatures field followed by the local features field.
+	if err := t.writeMessage([]byte{0, 16, 0, 0, 0, 0}); err != nil {
 		return err
 	}
 	for {

@@ -112,6 +112,42 @@ func TestTransportEncryptionBOLT8VectorAndRotation(t *testing.T) {
 	}
 }
 
+func TestPerformInitSendsBothFeatureVectors(t *testing.T) {
+	left, right := net.Pipe()
+	chain := array32(bytes.Repeat([]byte{1}, 32))
+	a := array32(bytes.Repeat([]byte{2}, 32))
+	b := array32(bytes.Repeat([]byte{3}, 32))
+	clientTransport := &transport{conn: left, send: cipherState{key: a, chain: chain}, receive: cipherState{key: b, chain: chain}}
+	serverTransport := &transport{conn: right, send: cipherState{key: b, chain: chain}, receive: cipherState{key: a, chain: chain}}
+	client := &LNSocket{Conn: left, transport: clientTransport, pending: make(map[uint64]chan rpcResult), done: make(chan struct{})}
+	defer client.Close()
+	defer right.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		message, err := serverTransport.readMessage()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		want := []byte{0, 16, 0, 0, 0, 0}
+		if !bytes.Equal(message, want) {
+			serverErr <- &mismatchError{"init message", message, want}
+			return
+		}
+		serverErr <- serverTransport.writeMessage(want)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.PerformInitContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestConcurrentRPCResponsesAreCorrelated(t *testing.T) {
 	left, right := net.Pipe()
 	chain := array32(bytes.Repeat([]byte{1}, 32))
